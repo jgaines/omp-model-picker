@@ -5,10 +5,10 @@
  *  - grouped list by provider with accent-colored section headers
  *  - rich rows: name + provider, context window, cost (in/out per M tokens),
  *    and a per-level colored thinking badge
- *  - LiveBench leaderboard scores (overall + coding) per model, fetched in
- *    the background at session start from livebench.ai, cached on disk, and
- *    refreshable on demand with `r`; sortable, with category bars in the
- *    detail card
+ *  - LiveBench leaderboard scores (overall, agentic + coding) per model,
+ *    fetched in the background at session start from livebench.ai, cached on
+ *    disk, and refreshable on demand with `r`; sortable, with category bars
+ *    in the detail card
  *  - a detail card for the focused model: context bar, cost bars,
  *    thinking selector (every supported level as a badge), and tags
  *  - type to fuzzy-filter with match highlighting, cycle sort, toggle scope
@@ -208,35 +208,42 @@ async function savePickerState(favorites: Set<string>, thinking: RememberedThink
 
 // ── LiveBench data layer (pure: no pi imports) ──────────────────────────────
 // Leaderboard data from livebench.ai, fetched in the background at session
-// start and cached to disk. The site is a React SPA, but its data files are
-// static, date-stamped CSV/JSON at the site root:
-//   table_<YYYY_MM_DD>.csv        per-task scores (0-100) for every model
-//   categories_<YYYY_MM_DD>.json  task -> category grouping
+// start and cached to disk. The site is a React SPA (LiveBench 2.0 since the
+// 2026-10-14 release), but its data files are static, date-stamped CSV/JSON
+// served from two locations:
+//   v2: data/<YYYYMMDD>/table.csv + categories.json   (one column per category)
+//   v1: v1/table_<YYYY_MM_DD>.csv + categories_<...>.json  (legacy releases)
 // The release dates are embedded in the site's JS bundle (main.<hash>.js),
 // so discovery means: fetch index.html, extract the bundle name, regex out
-// the date array. Scores aggregate exactly like the site computes them:
-// category = plain mean of its task scores, overall = mean of the category
-// means. The picker itself only ever reads the local cache; network happens
-// at session_start (TTL-gated) or on the manual refresh key.
+// the date arrays (v2 uses compact YYYYMMDD strings, v1 uses YYYY-MM-DD).
+// Scores aggregate exactly like the site computes them: category = plain
+// mean of its task scores, overall = mean of the category means. The picker
+// itself only ever reads the local cache; network happens at session_start
+// (TTL-gated) or on the manual refresh key.
 
 const LB_SITE = "https://livebench.ai";
 const LB_TTL_MS = 24 * 60 * 60 * 1000;
 const LB_TIMEOUT_MS = 10_000;
-// Five heat bands for scores. Thresholds fit the live field (spans ~62-83
-// with a median near 75): 80+ elite, 76+ strong, 71+ mid, 66+ weak, below
-// that poor. The greens and reds are pinned to explicit hex values so the
-// ladder stays exactly as tuned; yellow stays a theme token so the middle
-// band still follows the active theme.
+// Five heat bands for scores. Tuned for the LiveBench 2.0 field, where the
+// three displayed numbers live in different ranges (overall spans ~29-88
+// with a median near 69, the coding+agentic bracket median sits near 61,
+// agentic near 40): 80+ elite, 70+ strong, 60+ mid, 50+ weak, below that
+// poor. That keeps overall and bracket medians in yellow and dark green
+// exclusive to true 80+ scores. The greens and reds are pinned to explicit
+// hex values so the ladder stays exactly as tuned; yellow stays a theme
+// token so the middle band still follows the active theme.
 const LB_HEAT_BANDS: Array<{ min: number; color: string }> = [
     { min: 80, color: "#3BCA6D" }, // dark green, elite
-    { min: 76, color: "#00FF7F" }, // light green, strong
-    { min: 71, color: "warning" }, // yellow, mid
-    { min: 66, color: "#FF4444" }, // red, weak
+    { min: 70, color: "#00FF7F" }, // light green, strong
+    { min: 60, color: "warning" }, // yellow, mid
+    { min: 50, color: "#FF4444" }, // red, weak
     { min: 0, color: "#CC3333" }, // dark red, poor
 ];
 // Score bars are normalized so the leftmost segment means 50 rather than 0.
-// The live field sits between ~62 and ~83, so a 0-based bar renders nearly
-// identical for every model. Visual only, never surfaced as a number.
+// The overall field sits between ~30 and ~88, so a 0-based bar renders nearly
+// identical for every model (individual categories like agentic can dip much
+// lower; those bars just clamp to the first segment). Visual only, never
+// surfaced as a number.
 const LB_BAR_FLOOR = 50;
 const LB_BAR_SEGMENTS = 12;
 // Below this total width the score column disappears (rows get cramped).
@@ -253,7 +260,7 @@ interface LbRow {
 
 /** Disk cache shape (model-picker-livebench.json). */
 interface LbCache {
-    version: 1;
+    version: 2;
     release: string;
     releaseDates: string[];
     fetchedAt: number;
@@ -380,14 +387,39 @@ function lbCatScore(cats: Record<string, number>, pattern: RegExp, exclude?: Reg
     return null;
 }
 
+/** The coding bar score: excludes the "Agentic Coding" category in v1 data. */
+function lbCodingScore(m: LbMatch): number | null {
+    return lbCatScore(m.cats, /^coding/i, /agentic/i);
+}
+
+/** The agentic bar score: "Long Agentic" in v2 releases, "Agentic Coding" in v1. */
+function lbAgenticScore(m: LbMatch): number | null {
+    return lbCatScore(m.cats, /agentic/i);
+}
+
+/**
+ * The bracketed number in the table's score cell: the mean of the coding and
+ * agentic scores, falling back to whichever of the two exists.
+ */
+function lbBracketScore(m: LbMatch): number | null {
+    const cd = lbCodingScore(m);
+    const ag = lbAgenticScore(m);
+    if (cd === null) return ag;
+    if (ag === null) return cd;
+    return (cd + ag) / 2;
+}
+
 /** Compact label for the detail card's category summary line. */
 function lbShortCat(cat: string): string {
     const c = cat.toLowerCase();
     if (c.includes("agentic")) return "agentic";
     if (c.includes("reason")) return "reason";
+    if (c.includes("browser")) return "browser";
     if (c.includes("cod")) return "code";
     if (c.includes("math")) return "math";
     if (c.includes("data")) return "data";
+    if (c.includes("research")) return "research";
+    if (c.includes("design")) return "design";
     if (c.includes("lang")) return "lang";
     if (c === "if" || c.includes("instruction")) return "if";
     return c.split(/\s+/)[0]!.slice(0, 7);
@@ -565,15 +597,41 @@ function lbMatchModel(
     return subset ? { tested: subset.name, row: subset.row } : null;
 }
 
-/** Pull the release-date array out of the site's JS bundle. */
+/**
+ * Pull the release ids out of the site's JS bundle. v2 releases are compact
+ * YYYYMMDD strings ("20261014"), v1 releases are "YYYY-MM-DD"; both arrive as
+ * arrays of quoted literals, so scan for each shape and keep the longest hit.
+ */
 function lbExtractReleaseDates(bundle: string): string[] {
-    let best: string[] = [];
-    const arrayRe = /\[((?:\s*"\d{4}-\d{2}-\d{2}"\s*,?)+)\s*\]/g;
-    for (const m of bundle.matchAll(arrayRe)) {
-        const dates = [...m[1]!.matchAll(/"(\d{4}-\d{2}-\d{2})"/g)].map((d) => d[1]!);
-        if (dates.length >= 2 && dates.length > best.length) best = dates;
+    const arrayRes = [
+        /\[((?:\s*"\d{4}-\d{2}-\d{2}"\s*,?)+)\s*\]/g,
+        /\[((?:\s*"2[01]\d{6}"\s*,?)+)\s*\]/g,
+    ];
+    const found = new Set<string>();
+    for (const re of arrayRes) {
+        for (const m of bundle.matchAll(re)) {
+            for (const d of m[1]!.matchAll(/"(\d{4}-\d{2}-\d{2}|2[01]\d{6})"/g)) found.add(d[1]!);
+        }
     }
-    return best;
+    return [...found].sort((a, b) => lbReleaseNorm(a).localeCompare(lbReleaseNorm(b)));
+}
+
+/**
+ * Normalized YYYY-MM-DD for a release id, so the two generations sort
+ * together chronologically ("20261014" -> "2026-10-14").
+ */
+function lbReleaseNorm(id: string): string {
+    return /^\d{8}$/.test(id) ? `${id.slice(0, 4)}-${id.slice(4, 6)}-${id.slice(6, 8)}` : id;
+}
+
+/** Data URLs for a release id; v2 lives under /data/<YYYYMMDD>/, v1 under /v1/. */
+function lbReleaseUrls(id: string): { table: string; cats: string } {
+    if (/^\d{8}$/.test(id)) return {
+        table: `${LB_SITE}/data/${id}/table.csv`,
+        cats: `${LB_SITE}/data/${id}/categories.json`,
+    };
+    const d = id.replaceAll("-", "_");
+    return { table: `${LB_SITE}/v1/table_${d}.csv`, cats: `${LB_SITE}/v1/categories_${d}.json` };
 }
 
 /** Discover the release list: index.html -> main.<hash>.js -> date array. */
@@ -606,7 +664,7 @@ async function lbLoadCache(cacheFile: string): Promise<LbCache | null> {
     try {
         const raw = await readFile(cacheFile, "utf8");
         const parsed = JSON.parse(raw) as LbCache;
-        if (parsed && parsed.version === 1 && parsed.models && parsed.order && parsed.release) {
+        if (parsed && parsed.version === 2 && parsed.models && parsed.order && parsed.release) {
             return parsed;
         }
     } catch {
@@ -654,14 +712,17 @@ async function lbRefreshInner({ cacheFile, force }: { cacheFile: string; force?:
     const dates = await lbDiscoverReleases(existing?.releaseDates ?? []);
     if (dates.length === 0) return { ok: false, error: "no releases discovered" };
     let table: string | null = null;
+    let catsUrl = "";
     let release = "";
     for (let i = dates.length - 1, tried = 0; i >= 0 && tried < 3; i--, tried++) {
-        const d = dates[i]!;
+        const id = dates[i]!;
+        const urls = lbReleaseUrls(id);
         try {
-            const res = await lbFetch(`${LB_SITE}/table_${d.replaceAll("-", "_")}.csv`);
+            const res = await lbFetch(urls.table);
             if (res.ok) {
                 table = await res.text();
-                release = d;
+                catsUrl = urls.cats;
+                release = lbReleaseNorm(id);
                 break;
             }
         } catch {
@@ -672,7 +733,7 @@ async function lbRefreshInner({ cacheFile, force }: { cacheFile: string; force?:
 
     let categories: Record<string, string[]> | null = null;
     try {
-        const res = await lbFetch(`${LB_SITE}/categories_${release.replaceAll("-", "_")}.json`);
+        const res = await lbFetch(catsUrl);
         if (res.ok) {
             const json = (await res.json()) as unknown;
             if (json && typeof json === "object") {
@@ -691,7 +752,7 @@ async function lbRefreshInner({ cacheFile, force }: { cacheFile: string; force?:
     if (Object.keys(models).length === 0) return { ok: false, error: "no models parsed" };
     const order = Object.keys(models).sort((a, b) => models[b]!.overall - models[a]!.overall);
     const cache: LbCache = {
-        version: 1,
+        version: 2,
         release,
         releaseDates: dates,
         fetchedAt: Date.now(),
@@ -853,16 +914,12 @@ export default function modelPicker(pi: ExtensionAPI) {
                 }
             }
 
-            function lbCodingScore(m: LbMatch): number | null {
-                return lbCatScore(m.cats, /^coding/i, /agentic/i);
-            }
-
             /** Plain text of the score cell, for column-width math. */
             function lbCellText(e: PickerEntry): string {
                 const m = lbScores.get(keyOf(e.model));
                 if (!m) return "–";
-                const cd = lbCodingScore(m);
-                return `${m.overall.toFixed(1)}(${cd === null ? "–" : cd.toFixed(1)})`;
+                const bd = lbBracketScore(m);
+                return `${m.overall.toFixed(1)}(${bd === null ? "–" : bd.toFixed(1)})`;
             }
 
             rebuildLbScores();
@@ -1238,7 +1295,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                             blendCell = padLeft(theme.fg("dim", `~${fmtCost(blendedCost(m))}`), blendW);
                         }
 
-                        // Score cell: overall(coding). Both numbers carry the
+                        // Score cell: overall(coding+agentic mean). Both numbers carry the
                         // 5-band heat signal; overall is bold and first so it
                         // keeps primacy. Unmatched models get a dim dash so the
                         // column stays aligned.
@@ -1248,10 +1305,10 @@ export default function modelPicker(pi: ExtensionAPI) {
                             if (!sc) {
                                 scoreCell = padLeft(theme.fg("dim", "–"), scoreW);
                             } else {
-                                const cd = lbCodingScore(sc);
+                                const bd = lbBracketScore(sc);
                                 scoreCell = padLeft(
                                     lbFg(theme, lbHeat(sc.overall), theme.bold(sc.overall.toFixed(1))) +
-                                        lbFg(theme, cd === null ? "dim" : lbHeat(cd), cd === null ? "–" : `(${cd.toFixed(1)})`),
+                                        lbFg(theme, bd === null ? "dim" : lbHeat(bd), bd === null ? "–" : `(${bd.toFixed(1)})`),
                                     scoreW,
                                 );
                             }
@@ -1331,12 +1388,19 @@ export default function modelPicker(pi: ExtensionAPI) {
                         // LiveBench section: full breakdown when the terminal is
                         // tall enough, a one-line summary otherwise. The cost
                         // block above already ends with a blank line, so this
-                        // section starts flush against it.
+                        // section starts flush against it. Models without a
+                        // score (unmatched, or no data fetched yet) get a
+                        // same-height placeholder so the pane doesn't change
+                        // height while scrolling.
                         const sc = lbScores.get(key);
-                        if (sc && lbCache) {
-                            const roomy = ttyRows === 0 || ttyRows >= LB_DETAIL_MIN_ROWS;
-                            if (roomy) {
-                                const head = `livebench · ${lbStamp(lbCache)}`;
+                        const roomy = ttyRows === 0 || ttyRows >= LB_DETAIL_MIN_ROWS;
+                        if (roomy) {
+                            if (sc && lbCache) {
+                                // Effort rides on the head line rather than its
+                                // own optional row, so the block below always
+                                // renders the same number of lines.
+                                const head =
+                                    `livebench · ${lbStamp(lbCache)}` + (sc.effort ? ` · ${sc.effort} effort` : "");
                                 const rankStr = sc.rank !== null ? `#${sc.rank} / ${lbCache.order.length}` : "";
                                 out.push(
                                     `   ${theme.fg("dim", head)}` +
@@ -1346,11 +1410,21 @@ export default function modelPicker(pi: ExtensionAPI) {
                                 );
                                 const keyBars: Array<[string, number | null]> = [
                                     ["overall", sc.overall],
+                                    ["agentic", lbAgenticScore(sc)],
                                     ["coding", lbCodingScore(sc)],
                                     ["reasoning", lbCatScore(sc.cats, /reason/i)],
                                 ];
+                                // Every bar row renders, even when the category
+                                // is missing — a dim dash keeps the block the
+                                // same height for every model.
                                 for (const [label, v] of keyBars) {
-                                    if (v === null) continue;
+                                    if (v === null) {
+                                        out.push(
+                                            `   ${padRight(theme.fg("dim", label), 12)} ${padLeft(theme.fg("dim", "–"), 6)}  ` +
+                                                theme.fg("dim", "░".repeat(LB_BAR_SEGMENTS)),
+                                        );
+                                        continue;
+                                    }
                                     const filled = Math.max(
                                         1,
                                         Math.min(LB_BAR_SEGMENTS, Math.round(((v - LB_BAR_FLOOR) / (100 - LB_BAR_FLOOR)) * LB_BAR_SEGMENTS)),
@@ -1360,29 +1434,41 @@ export default function modelPicker(pi: ExtensionAPI) {
                                             `${lbFg(theme, lbHeat(v), "█".repeat(filled))}${theme.fg("dim", "░".repeat(LB_BAR_SEGMENTS - filled))}`,
                                     );
                                 }
+                                // Everything below the bars: the smaller
+                                // category scores (Data Analysis, Research,
+                                // Design in v2 releases). Bars, browser and
+                                // coding variants are already covered above.
                                 const rest = Object.entries(sc.cats)
-                                    .filter(([cat]) => !/^coding/i.test(cat) && !/reason/i.test(cat))
+                                    .filter(([cat]) => !/coding|agentic|reason|browser/i.test(cat))
                                     .map(([cat, v]) => `${lbShortCat(cat)} ${Math.round(v)}`);
-                                if (rest.length > 0) {
-                                    out.push(`   ${theme.fg("dim", truncateToWidth(rest.join(" · "), Math.max(8, W - 3), ""))}`);
-                                }
-                                // Tested level, phrased in the picker's own
-                                // thinking vocabulary and nothing else on the
-                                // line. Skipped entirely when the benchmark row
-                                // does not specify an effort level.
-                                if (sc.effort) {
-                                    out.push(`   ${theme.fg("accent", truncateToWidth(`thinking: ${sc.effort}`, Math.max(8, W - 3), ""))}`);
-                                }
+                                out.push(
+                                    `   ${theme.fg("dim", truncateToWidth(rest.length > 0 ? rest.join(" · ") : "–", Math.max(8, W - 3), ""))}`,
+                                );
                                 out.push("");
                             } else {
-                                const cd = lbCodingScore(sc);
-                                const bits = [
-                                    `Benchmarks ${sc.overall.toFixed(1)}(${cd === null ? "–" : cd.toFixed(1)})`,
-                                    sc.rank === null ? null : `#${sc.rank}/${lbCache.order.length}`,
-                                ].filter((s) => s !== null);
-                                out.push(`   ${theme.fg("dim", truncateToWidth(bits.join(" · "), Math.max(8, W - 3), ""))}`);
+                                // Placeholder: same shape as a real block
+                                // (head + 4 bars + summary line + blank).
+                                out.push(`   ${theme.fg("dim", lbCache ? "livebench · no match" : "livebench · no data")}`);
+                                for (const label of ["overall", "agentic", "coding", "reasoning"]) {
+                                    out.push(
+                                        `   ${padRight(theme.fg("dim", label), 12)} ${padLeft(theme.fg("dim", "–"), 6)}  ` +
+                                            theme.fg("dim", "░".repeat(LB_BAR_SEGMENTS)),
+                                    );
+                                }
+                                out.push(`   ${theme.fg("dim", "–")}`);
                                 out.push("");
                             }
+                        } else if (sc && lbCache) {
+                            const bd = lbBracketScore(sc);
+                            const bits = [
+                                `Benchmarks ${sc.overall.toFixed(1)}(${bd === null ? "–" : bd.toFixed(1)})`,
+                                sc.rank === null ? null : `#${sc.rank}/${lbCache.order.length}`,
+                            ].filter((s) => s !== null);
+                            out.push(`   ${theme.fg("dim", truncateToWidth(bits.join(" · "), Math.max(8, W - 3), ""))}`);
+                            out.push("");
+                        } else {
+                            out.push(`   ${theme.fg("dim", "Benchmarks –")}`);
+                            out.push("");
                         }
 
                         // Thinking selector
@@ -1425,10 +1511,10 @@ export default function modelPicker(pi: ExtensionAPI) {
                         const sc = lbScores.get(key);
                         let lbStr = "";
                         if (sc) {
-                            const cd = lbCodingScore(sc);
-                            const cdStr = cd === null ? "–" : cd.toFixed(1);
+                            const bd = lbBracketScore(sc);
+                            const bdStr = bd === null ? "–" : bd.toFixed(1);
                             const rankStr = sc.rank === null ? "" : ` · #${sc.rank}/${lbCache?.order.length ?? 0}`;
-                            lbStr = theme.fg("dim", ` · Benchmarks ${sc.overall.toFixed(1)}(${cdStr})${rankStr}`);
+                            lbStr = theme.fg("dim", ` · Benchmarks ${sc.overall.toFixed(1)}(${bdStr})${rankStr}`);
                         }
                         return truncateToWidth(
                             `${theme.fg("accent", theme.bold(displayName(m)))}` +
