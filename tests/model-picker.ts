@@ -3,30 +3,35 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { stripVTControlCharacters } from "node:util";
+import type { ThinkingLevel as OmpThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUiComponent } from "@oh-my-pi/pi-coding-agent";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { getKeybindings, getThemeByName, visibleWidth, type Component, type TUI, type Theme, type KeybindingsManager } from "@oh-my-pi/pi-tui";
+import type { Component, TUI, Theme, KeybindingsManager } from "@oh-my-pi/pi-tui";
 
 const dir = await mkdtemp(join(tmpdir(), "omp-model-picker-test-"));
+process.env.OMP_PROFILE = "default";
 process.env.PI_CODING_AGENT_DIR = dir;
 process.env.PI_CONFIG_DIR = dir;
 process.argv = [process.argv[0], fileURLToPath(import.meta.url), "--models", "anthropic/claude-sonnet-4-6:high,anthropic/claude-haiku-4-5:low"];
 
 try {
+    // OMP caches its directories on first import.
+    const { ThinkingLevel } = await import("@oh-my-pi/pi-agent-core/thinking");
+    const { Settings } = await import("@oh-my-pi/pi-coding-agent/config/settings");
+    const { getBundledModel } = await import("@oh-my-pi/pi-catalog/models");
+    const { getKeybindings, getThemeByName, visibleWidth } = await import("@oh-my-pi/pi-tui");
     await Settings.init({ inMemory: true, cwd: dir, agentDir: dir });
-    // Load after setting the temporary agent directory because the module captures its persistence paths.
     const { default: modelPicker } = await import("../extensions/model-picker.js");
     const theme = await getThemeByName("dark");
     assert(theme);
     const sonnet = getBundledModel("anthropic", "claude-sonnet-4-6");
     const haiku = getBundledModel("anthropic", "claude-haiku-4-5");
-    const models = [sonnet, haiku, { ...haiku, id: "unknown-window", contextWindow: null }];
+    const opus = getBundledModel("anthropic", "claude-opus-4-6");
+    const models = [sonnet, haiku, opus, { ...haiku, id: "unknown-window", contextWindow: null }];
     const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
     let selected = sonnet;
-    let thinking: ThinkingLevel | undefined = ThinkingLevel.High;
-    let appliedThinking: ThinkingLevel | undefined;
+    let thinking: OmpThinkingLevel | undefined = ThinkingLevel.High;
+    let appliedThinking: OmpThinkingLevel | undefined;
     let interact: (component: Component) => void;
     // The test supplies only the API members the picker uses.
     modelPicker({
@@ -63,7 +68,7 @@ try {
         assert.match(frame(component), /2 models/);
         assert.match(frame(component), /high/);
         input(component, "\t");
-        assert.match(frame(component), /3 models/);
+        assert.match(frame(component), /4 models/);
         for (const width of [24, 80, 140]) {
             assert(component.render(width).every(line => visibleWidth(line) <= width));
         }
@@ -86,7 +91,17 @@ try {
     await commands.get("model-picker")!.handler("", context);
     assert.equal(selected.id, sonnet.id);
     assert.equal(appliedThinking, undefined);
-    console.log("PASS: native OMP scope, rendering, filtering, model/thinking selection, and default-thinking preservation");
+    selected = opus;
+    interact = (component) => {
+        input(component, "\x1b[D");
+        assert.match(frame(component), /▸max/);
+        assert.match(stripVTControlCharacters(frame(component, 80)), /\bmax\b/);
+        input(component, "\r");
+    };
+    await commands.get("model-picker")!.handler("", context);
+    assert.equal(selected.id, opus.id);
+    assert.equal(appliedThinking, "max");
+    console.log("PASS: native OMP scope, rendering, filtering, max thinking selection, and default-thinking preservation");
 } finally {
     await rm(dir, { recursive: true, force: true });
 }

@@ -71,7 +71,7 @@ const THINK_COLOR: Record<ModelThinkingLevel, string> = {
     medium: "thinkingMedium",
     high: "thinkingHigh",
     xhigh: "thinkingXhigh",
-    max: "thinkingMax",
+    max: "thinkingXhigh", // OMP themes need not define a separate max color.
 };
 
 // Palette used to tint provider group headers.

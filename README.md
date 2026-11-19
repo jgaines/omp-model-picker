@@ -24,7 +24,7 @@ For development, run `npm install`, `npm run typecheck`, and `npm test`. The reg
 - **Check benchmark results.** View LiveBench overall, agentic, and coding scores, category breakdowns, and leaderboard rank alongside each model. Data is cached locally, refreshed in the background at most once a day, and dated in the picker. Press `r` to refresh it manually.
 - **Find and organize your options.** Models are grouped by provider, with favorites pinned to the top. Type to fuzzy-filter, cycle sorting by default order, price, context, score, or name, and switch between scoped models and all authenticated chat models.
 - **Pick your favourites.** Press `f` on any model to set it as a favourite so it always appears at the top of the list and is easy to access.
-- **Set thinking per model.** Preview and change a model's supported thinking level before switching. The picker remembers the last level used for each model.
+- **Set thinking per model.** Preview and change a model's supported thinking level before switching. The picker remembers the last level used for each model. `max` stays selectable on models that support it and uses the same theme color as `xhigh`.
 - **Keep the overview in view.** A two-pane comparison appears in wide terminals; narrower terminals switch to a compact layout.
 
 ## Keyboard controls
