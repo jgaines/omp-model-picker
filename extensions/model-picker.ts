@@ -1,5 +1,5 @@
 /**
- * Model Picker — a grand /models switcher for pi.
+ * Model Picker: /model-picker switcher for OMP.
  *
  * A two-pane model switcher in the spirit of Cursor / Claude Code:
  *  - grouped list by provider with accent-colored section headers
@@ -16,24 +16,26 @@
  *    alongside favorites, so a level change no longer bleeds across models)
  *  - adapts to narrow terminals by dropping to a single pane + footer
  *
- * Install: copy to ~/.pi/agent/extensions/ (global) or .pi/extensions/,
- * then /reload, then use /models.
+ * Install: omp plugin link /path/to/omp-model-picker,
+ * then restart OMP and use /model-picker.
  */
 
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, resolveScopedModels, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import {
     getKeybindings,
     matchesKey,
     Key,
-    decodeKittyPrintable,
+    decodePrintableKey,
     fuzzyFilter,
     truncateToWidth,
     visibleWidth,
-} from "@earendil-works/pi-tui";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+} from "@oh-my-pi/pi-tui";
+import { getSupportedEfforts, type Effort, type Model } from "@oh-my-pi/pi-catalog";
 import { readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
+
+type ModelThinkingLevel = "off" | Effort;
 
 interface PickerEntry {
     model: Model<any>;
@@ -122,10 +124,9 @@ function groupCost(entries: Array<{ model: { cost: { input: number; output: numb
 }
 
 // ── favorites + per-model thinking persistence ──────────────────────────────────
-// Starred models are stored as `provider\0id` keys in a JSON file next to pi's
-// other agent config (models.json, settings.json). The same file also remembers
-// the last thinking level each model was picked with, so a level change applied
-// to one model in the picker no longer bleeds into every other model on the
+// Starred models are stored as `provider\0id` keys beside OMP's agent config.
+// The same file remembers the last thinking level each model was picked with,
+// so changing one model's level does not change the others on the
 // next open. Legacy files (a bare array of favorite keys) are still read and
 // upgraded to the object form on the next save.
 const FAVORITES_FILE = join(getAgentDir(), "model-picker-favorites.json");
@@ -779,7 +780,8 @@ function heatColor(ratio: number): string {
     return "error";
 }
 
-function fmtCtx(n: number): string {
+function fmtCtx(n: number | null): string {
+    if (n === null) return "?";
     if (n >= 1_000_000) {
         const m = n / 1_000_000;
         return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
@@ -817,50 +819,42 @@ function highlightMatch(text: string, query: string, theme: any): string {
     const before = text.slice(0, idx);
     const match = text.slice(idx, idx + query.length);
     const after = text.slice(idx + query.length);
-    const hi = theme.bg("searchMatchBg", theme.fg("searchMatchText", match));
+    const hi = theme.bg("selectedBg", theme.fg("accent", match));
     return `${before}${hi}${after}`;
 }
 
 export default function modelPicker(pi: ExtensionAPI) {
-    // Shared entry point for the picker UI. Both the /models command and the
+    // Shared entry point for the picker UI. Both the /model-picker command and the
     // ctrl+shift+l shortcut call this so they behave identically.
     async function openModelPicker(ctx: ExtensionContext) {
             if (ctx.mode !== "tui") {
-                ctx.ui.notify("/models requires TUI mode", "error");
+                ctx.ui.notify("/model-picker requires TUI mode", "error");
                 return;
             }
 
             const current = ctx.model;
-            const currentThinking = ctx.thinkingLevel ?? "off";
+            const level = pi.getThinkingLevel();
+            const currentThinking = level === "inherit" ? undefined : level;
             // Key of the live model, so per-model memory can defer to the real
             // session level for the model that is currently selected.
             const currentKey = current ? keyOf(current) : "";
 
+            // OMP exposes scope through its resolver, not Pi's ctx.scopedModels.
+            const scopedModels = await resolveScopedModels(parseArgs(process.argv.slice(2)), ctx.modelRegistry, settings);
             // Pinned thinking levels from scoped-model patterns (e.g. "model:high").
             const pinned = new Map<string, ModelThinkingLevel>();
-            for (const s of ctx.scopedModels) {
-                if (s.thinkingLevel) pinned.set(keyOf(s.model), s.thinkingLevel);
+            for (const s of scopedModels) {
+                if (s.thinkingLevel && s.thinkingLevel !== "inherit") pinned.set(keyOf(s.model), s.thinkingLevel);
             }
 
-            const scopedEntries: PickerEntry[] = ctx.scopedModels.map((s) => ({
+            const scopedEntries: PickerEntry[] = scopedModels.map((s) => ({
                 model: s.model,
-                supported: getSupportedThinkingLevels(s.model),
+                supported: ["off", ...getSupportedEfforts(s.model)],
             }));
-            const allEntries: PickerEntry[] = ctx.modelRegistry
-                .getAvailable()
-                .map((m) => ({ model: m, supported: getSupportedThinkingLevels(m) }));
+            const allEntries: PickerEntry[] = ctx.models.list()
+                .map((m) => ({ model: m, supported: ["off", ...getSupportedEfforts(m)] }));
             const canScope = scopedEntries.length > 0;
             let useScoped = canScope;
-
-            // Provider display names (fall back to raw id).
-            const providerNames = new Map<string, string>();
-            for (const e of [...scopedEntries, ...allEntries]) {
-                const p = e.model.provider;
-                if (!providerNames.has(p)) {
-                    const dn = ctx.modelRegistry.getProviderDisplayName(p);
-                    providerNames.set(p, dn || p);
-                }
-            }
 
             // Favorites (a pinned set of model keys, provider\0id) plus the
             // last-used thinking level per model, persisted together across
@@ -966,7 +960,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                         if (av !== bv) return bv - av;
                     }
                     if (state.sort === "cost") return costOf(a) - costOf(b);
-                    if (state.sort === "context") return b.model.contextWindow - a.model.contextWindow;
+                    if (state.sort === "context") return (b.model.contextWindow ?? 0) - (a.model.contextWindow ?? 0);
                     if (state.sort === "name") {
                         return (a.model.name || a.model.id).localeCompare(b.model.name || b.model.id);
                     }
@@ -1045,14 +1039,14 @@ export default function modelPicker(pi: ExtensionAPI) {
                         // The live session level is the truth for the currently
                         // selected model (it may have been changed via /thinking
                         // since the picker last ran).
-                        if (key === currentKey && e.supported.includes(currentThinking)) return currentThinking;
+                        if (key === currentKey && currentThinking && e.supported.includes(currentThinking)) return currentThinking;
                         // Last level used with this model (persisted).
                         const rem = remembered.get(key);
                         if (rem && e.supported.includes(rem)) return rem;
                         // Pinned level from scoped-model patterns (e.g. "model:high").
                         const pin = pinned.get(key);
                         if (pin && e.supported.includes(pin)) return pin;
-                        if (e.supported.includes(currentThinking)) return currentThinking;
+                        if (currentThinking && e.supported.includes(currentThinking)) return currentThinking;
                         if (e.supported.includes("off")) return "off";
                         return e.supported[e.supported.length - 1] ?? "off";
                     }
@@ -1065,7 +1059,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                         if (width < 28) {
                             // Too narrow to frame; one short line keeps the TUI
                             // from crashing on an over-wide rendered row.
-                            return [theme.fg("warning", "model picker needs a wider terminal")];
+                            return [truncateToWidth(theme.fg("warning", "model picker needs a wider terminal"), width, "")];
                         }
                         const lbAny = lbScores.size > 0;
                         const showScores = lbAny && width >= LB_MIN_WIDTH;
@@ -1189,7 +1183,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                                 const col = isFav ? "warning" : providerColor(item.provider);
                                 const label = isFav
                                     ? "\u2605 Favorites"
-                                    : providerNames.get(item.provider) || item.provider;
+                                    : item.provider;
                                 const head = `${theme.fg("dim", "──")} ${theme.fg(col, theme.bold(label))} ${theme.fg("dim", `· ${item.count}`)}`;
                                 listLines.push(padRight(truncateToWidth(" " + head, listW, ""), listW));
                                 continue;
@@ -1269,7 +1263,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                         // Model capabilities (vision/video/reasoning) are shown in
                         // the detail card, not as icons next to the name.
                         const rawName = displayName(m);
-                        const nameTxt = truncateToWidth(rawName, Math.max(1, nameW), "…");
+                        const nameTxt = truncateToWidth(rawName, Math.max(1, nameW));
                         const namePart = isSelected
                             ? theme.fg("accent", theme.bold(highlightMatch(nameTxt, state.filter, theme)))
                             : theme.fg("text", highlightMatch(nameTxt, state.filter, theme));
@@ -1345,7 +1339,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                         const W = DETAIL_W - 2;
 
                         out.push(theme.fg("accent", theme.bold(truncateToWidth(displayName(m), W, ""))));
-                        out.push(theme.fg("muted", truncateToWidth(`${m.id} · ${providerNames.get(m.provider) || m.provider}`, W, "")));
+                        out.push(theme.fg("muted", truncateToWidth(`${m.id} · ${m.provider}`, W, "")));
                         out.push("");
 
                         // Context bar
@@ -1523,7 +1517,6 @@ export default function modelPicker(pi: ExtensionAPI) {
                                 lbStr +
                                 `${theme.fg("dim", "  think:")} ${theme.fg(THINK_COLOR[thinkLevel], thinkList)}`,
                             w,
-                            "…",
                         );
                     }
 
@@ -1664,7 +1657,10 @@ export default function modelPicker(pi: ExtensionAPI) {
                                     const key = keyOf(focused.model);
                                     done({
                                         model: focused.model,
-                                        thinking: pendingThinking.get(key) ?? effectiveThinking(key, focused),
+                                        // Preserve OMP's automatic/default mode unless this model has an explicit level.
+                                        thinking: pendingThinking.get(key) ??
+                                            (currentThinking === undefined && !remembered.has(key) && !pinned.has(key)
+                                                ? undefined : effectiveThinking(key, focused)),
                                     });
                                 }
                                 return true;
@@ -1700,7 +1696,7 @@ export default function modelPicker(pi: ExtensionAPI) {
                             }
 
                             // Printable char → filter
-                            const ch = data.length === 1 ? data : decodeKittyPrintable(data);
+                            const ch = data.length === 1 ? data : decodePrintableKey(data);
                             if (ch && ch.length === 1 && /[\u0020-\u007e]/.test(ch)) {
                                 state.filter += ch;
                                 state.selected = 0;
@@ -1737,7 +1733,7 @@ export default function modelPicker(pi: ExtensionAPI) {
             }
     }
 
-    pi.registerCommand("models", {
+    pi.registerCommand("model-picker", {
         description: "Model switcher: grouped, sortable, with cost/context/thinking detail",
         handler: async (_args, ctx) => {
             await openModelPicker(ctx);
@@ -1748,7 +1744,7 @@ export default function modelPicker(pi: ExtensionAPI) {
     // binding claims. It relies on the terminal reporting shifted control
     // chords distinctly (kitty keyboard protocol); iTerm2 supports this.
     pi.registerShortcut(Key.ctrlShift("l"), {
-        description: "Open model picker (/models)",
+        description: "Open model picker (/model-picker)",
         handler: (ctx) => openModelPicker(ctx),
     });
 
